@@ -181,8 +181,37 @@ void StartSPI_RX_Task(void *argument);
 #define INVALID_PARAM_COUNT  0x03
 #define PARAM_NOT_SUPPORTED  0x04
 
+#define ADS1256_REG_STATUS   0x00
+#define ADS1256_REG_MUX      0x01
+#define ADS1256_REG_ADCON    0x02
+#define ADS1256_REG_DRATE    0x03
+#define ADS1256_REG_IO       0x04
+#define ADS1256_REG_OFC0     0x05
+#define ADS1256_REG_OFC1     0x06
+#define ADS1256_REG_OFC2     0x07
+#define ADS1256_REG_FSC0     0x08
+#define ADS1256_REG_FSC1     0x09
+#define ADS1256_REG_FSC2     0x0A
+
+#define ADS1256_COM_WAKEUP   0x00
+#define ADS1256_COM_RDATA    0x01
+#define ADS1256_COM_RDATAC   0x03
+#define ADS1256_COM_SDATAC   0x0F
+#define ADS1256_COM_RREG     0x10
+#define ADS1256_COM_WREG     0x50
+#define ADS1256_COM_SELFCAL  0xF0
+#define ADS1256_COM_SELFOCAL 0xF1
+#define ADS1256_COM_SELFGCAL 0xF2
+#define ADS1256_COM_SYSOCAL  0xF3
+#define ADS1256_COM_SYSGCAL  0xF4
+#define ADS1256_COM_SYNC     0xFC
+#define ADS1256_COM_STANDBY  0xFD
+#define ADS1256_COM_RESET    0xFE
+#define ADS1256_COM_SNCWKP   0xFF
+
 uint8_t UART_RX_buf[UART_RX_BUFFER_SIZE];
 uint8_t UART_RX_bytes_received = 0;
+uint8_t naverage = 5;
 
 typedef struct {
     uint8_t command_id;               // 1 byte: Il comando
@@ -240,16 +269,89 @@ void ShowFrame(CommsFrame_t* pframe)
 	}
 }
 
-void SendResponse(uint8_t command_id, uint8_t statuscode)
+void SendResponse(uint8_t command_id, uint8_t statuscode, uint8_t nbytes, uint8_t* payload)
 {
 	CommsFrame_t frame_out;
 
 	frame_out.command_id = command_id;
 	frame_out.statuscode = statuscode;
-	frame_out.nbytes = 0;
+	frame_out.nbytes = nbytes;
+
+	if (nbytes > 0)
+	{
+		memcpy(&frame_out.payload, payload, nbytes);
+	}
+
 	osMessageQueuePut(txDataQueueHandle, &frame_out, 0, 0);
 }
 
+
+void delay_busywait(uint32_t count) {								// impostare TIM9 con un prescaler di 84-1 per avere un clock da 1 us/count
+
+    __HAL_TIM_SET_COUNTER(&htim9, 0);								// Reimposta il contatore del timer
+    __HAL_TIM_ENABLE(&htim9);										// Avvia il timer
+
+    while (__HAL_TIM_GET_COUNTER(&htim9) < count);					// Attendi in un ciclo finché il contatore non raggiunge il valore desiderato
+
+    __HAL_TIM_DISABLE(&htim9);										// Ferma il timer
+}
+
+
+uint8_t ADS1256_ReadRegister(uint8_t registerID)
+{
+	  uint8_t tx_data[2];
+	  uint8_t rx_data[1];
+
+	  HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_RESET);						// abbasso CS
+
+	  tx_data[0] = ADS1256_COM_RREG | registerID;									// comando RREG e offset registro
+	  tx_data[1] = 0x00;															// numero di bytes da leggere - 1 (impostare a zero per leggere 1 byte)
+
+	  HAL_SPI_Transmit(&hspi3, tx_data, 2, HAL_MAX_DELAY);							// invio due bytes
+
+	  delay_busywait(10ul);															// attendo 10 us (vedi configurazione di TIM9
+
+	  HAL_SPI_Receive(&hspi3, rx_data, 1, HAL_MAX_DELAY);							// ricevo un byte via SPI
+
+	  HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_SET);						// alzo CS
+
+	  delay_busywait(5ul);
+
+	  return rx_data[0];
+
+}
+
+void ADS1256_WriteRegister(uint8_t registerID, uint8_t value)
+{
+	  uint8_t tx_data[3];
+
+	  HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_RESET);						// abbasso CS
+
+	  tx_data[0] = ADS1256_COM_WREG | registerID;									// comando WREG e offset registro
+	  tx_data[1] = 0x00;															// numero di bytes da scrivere - 1 (impostare a zero per scrivere 1 byte)
+	  tx_data[2] = value;
+
+	  HAL_SPI_Transmit(&hspi3, tx_data, 3, HAL_MAX_DELAY);							// invio tre bytes
+
+	  delay_busywait(10ul);															// attendo 10 us (vedi configurazione di TIM9)
+
+	  HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_SET);						// alzo CS
+
+	  delay_busywait(10ul);															// attendo 10 us (vedi configurazione di TIM9)
+}
+
+void ADS1256_SendCommand(uint8_t commandID)
+{
+	  HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_RESET);						// abbasso CS
+
+	  HAL_SPI_Transmit(&hspi3, &commandID, 1, HAL_MAX_DELAY);						// invio un byte
+
+	  delay_busywait(5ul);															// attendo 5 us (vedi configurazione di TIM9)
+
+	  HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_SET);						// alzo CS
+
+	  delay_busywait(5ul);															// attendo 5 us (vedi configurazione di TIM9)
+}
 
 /* USER CODE END 0 */
 
@@ -743,7 +845,8 @@ void StartCommand_Handler(void *argument)
   /* Infinite loop */
 
 	CommsFrame_t frame_in;
-//	CommsFrame_t frame_out;
+	uint8_t reg;
+	uint8_t payload[MAX_PARAM_BYTES];
 
 	for(;;)
 	{
@@ -751,58 +854,49 @@ void StartCommand_Handler(void *argument)
 
 		if (status == osOK)
 		{
-
-			printf("---------  StartCommand_Handler: inizio.  ---------\n");
-
 			switch (frame_in.command_id)
 			{
 			case WAKEUP:
 				printf("Comando WAKEUP\n");
 
-				// TODO: Process command
-				// ...
+				ADS1256_SendCommand(ADS1256_COM_WAKEUP);
 
-				SendResponse(frame_in.command_id, SUCCESS);
+				SendResponse(frame_in.command_id, SUCCESS, 0, NULL);
 				break;
 			case SELFCAL:
 				printf("Comando SELFCAL\n");
 
-				// TODO: Process command
-				// ...
+				ADS1256_SendCommand(ADS1256_COM_SELFCAL);
 
-				SendResponse(frame_in.command_id, SUCCESS);
+				SendResponse(frame_in.command_id, SUCCESS, 0, NULL);
 				break;
 			case SELFOCAL:
 				printf("Comando SELFOCAL\n");
 
-				// TODO: Process command
-				// ...
+				ADS1256_SendCommand(ADS1256_COM_SELFOCAL);
 
-				SendResponse(frame_in.command_id, SUCCESS);
+				SendResponse(frame_in.command_id, SUCCESS, 0, NULL);
 				break;
 			case SELFGCAL:
 				printf("Comando SELFGCAL\n");
 
-				// TODO: Process command
-				// ...
+				ADS1256_SendCommand(ADS1256_COM_SELFGCAL);
 
-				SendResponse(frame_in.command_id, SUCCESS);
+				SendResponse(frame_in.command_id, SUCCESS, 0, NULL);
 				break;
 			case SYSOCAL:
 				printf("Comando SYSOCAL\n");
 
-				// TODO: Process command
-				// ...
+				ADS1256_SendCommand(ADS1256_COM_SYSOCAL);
 
-				SendResponse(frame_in.command_id, SUCCESS);
+				SendResponse(frame_in.command_id, SUCCESS, 0, NULL);
 				break;
 			case SYSGCAL:
 				printf("Comando SYSGCAL\n");
 
-				// TODO: Process command
-				// ...
+				ADS1256_SendCommand(ADS1256_COM_SYSGCAL);
 
-				SendResponse(frame_in.command_id, SUCCESS);
+				SendResponse(frame_in.command_id, SUCCESS, 0, NULL);
 				break;
 			case TRIGGER:
 				printf("Comando TRIGGER\n");
@@ -810,72 +904,66 @@ void StartCommand_Handler(void *argument)
 				// TODO: Process command
 				// ...
 
-				SendResponse(frame_in.command_id, SUCCESS);
+				SendResponse(frame_in.command_id, SUCCESS, 0, NULL);
 				break;
 			case STANDBY:
 				printf("Comando STANDBY\n");
 
-				// TODO: Process command
-				// ...
+				ADS1256_SendCommand(ADS1256_COM_STANDBY);
 
-				SendResponse(frame_in.command_id, SUCCESS);
+				SendResponse(frame_in.command_id, SUCCESS, 0, NULL);
 				break;
 			case RESET:
 				printf("Comando RESET\n");
 
-				// TODO: Process command
-				// ...
+				ADS1256_SendCommand(ADS1256_COM_RESET);
 
-				SendResponse(frame_in.command_id, SUCCESS);
+				SendResponse(frame_in.command_id, SUCCESS, 0, NULL);
 				break;
 			case ACALON:
 				printf("Comando ACALON\n");
 
-				// TODO: Process command
-				// ...
+				reg = ADS1256_ReadRegister(ADS1256_REG_STATUS) | 0b00000100;
+				ADS1256_WriteRegister(ADS1256_REG_STATUS, reg);
 
-				SendResponse(frame_in.command_id, SUCCESS);
+				SendResponse(frame_in.command_id, SUCCESS, 0, NULL);
 				break;
 			case ACALOFF:
 				printf("Comando ACALOFF\n");
 
-				// TODO: Process command
-				// ...
+				reg = ADS1256_ReadRegister(ADS1256_REG_STATUS) & 0b11111011;
+				ADS1256_WriteRegister(ADS1256_REG_STATUS, reg);
 
-				SendResponse(frame_in.command_id, SUCCESS);
+				SendResponse(frame_in.command_id, SUCCESS, 0, NULL);
 				break;
 			case BUFEN:
 				printf("Comando BUFEN\n");
 
-				// TODO: Process command
-				// ...
+				reg = ADS1256_ReadRegister(ADS1256_REG_STATUS) | 0b00000010;
+				ADS1256_WriteRegister(ADS1256_REG_STATUS, reg);
 
-				SendResponse(frame_in.command_id, SUCCESS);
+				SendResponse(frame_in.command_id, SUCCESS, 0, NULL);
 				break;
 			case BUFDIS:
 				printf("Comando BUFDIS\n");
 
-				// TODO: Process command
-				// ...
+				reg = ADS1256_ReadRegister(ADS1256_REG_STATUS) & 0b11111101;
+				ADS1256_WriteRegister(ADS1256_REG_STATUS, reg);
 
-				SendResponse(frame_in.command_id, SUCCESS);
+				SendResponse(frame_in.command_id, SUCCESS, 0, NULL);
 				break;
 			case MUX:
 				printf("Comando MUX\n");
 
-				uint8_t muxconf = frame_in.payload[0];
-				printf("Parametro: 0x%X\n", muxconf);
+				reg = frame_in.payload[0];
+				ADS1256_WriteRegister(ADS1256_REG_MUX, reg);
 
-				// TODO: Process command
-				// ...
-
-				SendResponse(frame_in.command_id, SUCCESS);
+				SendResponse(frame_in.command_id, SUCCESS, 0, NULL);
 				break;
 			case PGA:
 				printf("Comando PGA\n");
 
 				uint8_t pga = frame_in.payload[0];
-				printf("Parametro: 0x%X\n", pga);
 
 				// Validate parameter
 				// pga value   gain
@@ -890,14 +978,14 @@ void StartCommand_Handler(void *argument)
 
 				if (pga > 7)
 				{
-					SendResponse(frame_in.command_id, INVALID_PARAM_VALUE);
+					SendResponse(frame_in.command_id, INVALID_PARAM_VALUE, 0, NULL);
 				}
 				else
 				{
-					// TODO: Process command
-					// ...
+					reg = (ADS1256_ReadRegister(ADS1256_REG_ADCON) & 0b11111000) | pga;
+					ADS1256_WriteRegister(ADS1256_REG_ADCON, reg);
 
-					SendResponse(frame_in.command_id, SUCCESS);
+					SendResponse(frame_in.command_id, SUCCESS, 0, NULL);
 				}
 
 				break;
@@ -905,7 +993,6 @@ void StartCommand_Handler(void *argument)
 				printf("Comando DRATE\n");
 
 				uint8_t drate = frame_in.payload[0];
-				printf("Parametro: 0x%X\n", drate);
 
 				// Validate parameter
 				switch(drate)
@@ -927,13 +1014,12 @@ void StartCommand_Handler(void *argument)
 				case DRATE_5SPS:
 				case DRATE_2_5SPS:
 
-					// TODO: Process command
-					// ...
+					ADS1256_WriteRegister(ADS1256_REG_DRATE, drate);
 
-					SendResponse(frame_in.command_id, SUCCESS);
+					SendResponse(frame_in.command_id, SUCCESS, 0, NULL);
 					break;
 				default:
-					SendResponse(frame_in.command_id, INVALID_PARAM_VALUE);
+					SendResponse(frame_in.command_id, INVALID_PARAM_VALUE, 0, NULL);
 				}
 
 				break;
@@ -946,25 +1032,21 @@ void StartCommand_Handler(void *argument)
 
 				printf("Parametri: 0x%X 0x%X 0x%X\n", ofc1, ofc2, ofc3);
 
-
-				// TODO: Validate parameters
-				// ...
-
 				// TODO: Process command
 				// ...
 
-				SendResponse(frame_in.command_id, SUCCESS);
+				SendResponse(frame_in.command_id, SUCCESS, 0, NULL);
 				break;
 			case OFCR:
 				printf("Comando OFCR\n");
 
-				// TODO: Validate parameters
-				// ...
+				// OFC0, OFC1, OFC2
+				payload[0] = ADS1256_ReadRegister(ADS1256_REG_OFC0);
+				payload[1] = ADS1256_ReadRegister(ADS1256_REG_OFC1);
+				payload[2] = ADS1256_ReadRegister(ADS1256_REG_OFC2);
 
-				// TODO: Process command
-				// ...
+				SendResponse(frame_in.command_id, SUCCESS, 3, payload);
 
-				SendResponse(frame_in.command_id, SUCCESS);
 				break;
 			case FSCW:
 				printf("Comando FSCW\n");
@@ -975,54 +1057,68 @@ void StartCommand_Handler(void *argument)
 
 				printf("Parametri: 0x%X 0x%X 0x%X\n", fsc1, fsc2, fsc3);
 
+				// TODO: Validate parameters
+				// ...
+
 				// TODO: Process command
 				// ...
 
-				SendResponse(frame_in.command_id, SUCCESS);
+				SendResponse(frame_in.command_id, SUCCESS, 0, NULL);
 				break;
 			case FSCR:
 				printf("Comando FSCR\n");
 
-				// TODO: Process command
-				// ...
+				// FSC0, FSC1, FSC2
+				payload[0] = ADS1256_ReadRegister(ADS1256_REG_FSC0);
+				payload[1] = ADS1256_ReadRegister(ADS1256_REG_FSC1);
+				payload[2] = ADS1256_ReadRegister(ADS1256_REG_FSC2);
 
-				SendResponse(frame_in.command_id, SUCCESS);
+				SendResponse(frame_in.command_id, SUCCESS, 3, payload);
+
 				break;
 			case AVERAGE:
 				printf("Comando AVERAGE\n");
 
 				uint8_t navg = frame_in.payload[0];
-
 				printf("Parametro: 0x%X\n", navg);
 
-				// TODO: Process command
-				// ...
+				naverage = frame_in.payload[0];
 
-				SendResponse(frame_in.command_id, SUCCESS);
+				SendResponse(frame_in.command_id, SUCCESS, 0, NULL);
 				break;
 			case READREGS:
 				printf("Comando READREGS\n");
 
-				// TODO: Process command
-				// ...
+				// STATUS, MUX, ADCON, DRATE, IO, AVERAGE
+				payload[0] = ADS1256_ReadRegister(ADS1256_REG_STATUS);
+				payload[1] = ADS1256_ReadRegister(ADS1256_REG_MUX);
+				payload[2] = ADS1256_ReadRegister(ADS1256_REG_ADCON);
+				payload[3] = ADS1256_ReadRegister(ADS1256_REG_DRATE);
+				payload[4] = ADS1256_ReadRegister(ADS1256_REG_IO);
+				payload[5] = naverage;
 
-				SendResponse(frame_in.command_id, SUCCESS);
+				SendResponse(frame_in.command_id, SUCCESS, 6, payload);
+
 				break;
 			case READCAL:
 				printf("Comando READCAL\n");
 
-				// TODO: Process command
-				// ...
+				// OFC0, OFC1, OFC2, FSC0, FSC1, FSC2
+				payload[0] = ADS1256_ReadRegister(ADS1256_REG_OFC0);
+				payload[1] = ADS1256_ReadRegister(ADS1256_REG_OFC1);
+				payload[2] = ADS1256_ReadRegister(ADS1256_REG_OFC2);
+				payload[3] = ADS1256_ReadRegister(ADS1256_REG_FSC0);
+				payload[4] = ADS1256_ReadRegister(ADS1256_REG_FSC1);
+				payload[5] = ADS1256_ReadRegister(ADS1256_REG_FSC2);
 
-				SendResponse(frame_in.command_id, SUCCESS);
+				SendResponse(frame_in.command_id, SUCCESS, 6, payload);
+
 				break;
 
 			default:
-				SendResponse(frame_in.command_id, INVALID_COMMAND);
+				SendResponse(frame_in.command_id, INVALID_COMMAND, 0, NULL);
 				printf("StartCommand_Handler ERROR: messaggio sconosciuto.\n");
 			}
-
-			printf("-------  StartCommand_Handler: fine. -------------\n");
 		}
 		else
 		{
