@@ -157,6 +157,7 @@ void StartSPI_RX_Task(void *argument);
 #define AVERAGE   0xF4
 #define READREGS  0xF5
 #define READCAL   0xF6
+#define DUMMY     0xF7
 
 #define DRATE_30000SPS       0b11110000
 #define DRATE_15000SPS       0b11100000
@@ -211,7 +212,17 @@ void StartSPI_RX_Task(void *argument);
 
 uint8_t UART_RX_buf[UART_RX_BUFFER_SIZE];
 uint8_t UART_RX_bytes_received = 0;
-uint8_t naverage = 5;
+
+volatile uint8_t read_data_on_drdy = false;			// enable (true) or disable (false) the call of StartSPI_RX_Task on DRDY; checked in HAL_GPIO_EXTI_Callback
+volatile int32_t adccode;							// ultima conversione ADC, aggiornato nella nella ADS1256ReadData. Il dato intero va scalato per avere il valore in volt.
+volatile int32_t adccodesum = 0;					// accumulatore delle conversioni ADC, usata per calcolare il valor medio
+volatile uint8_t nmeas = 0;							// numero di conversioni accumulate in adccodesum
+volatile uint8_t naverage = 5;                      // numero di conversioni per il calcolo della media
+volatile double dvoltage = 0.;						// tensione media misurata, tiene conto di pga
+volatile uint8_t pga = 0;
+
+const double vres_lut[] = {5.960465188081883e-7, 2.980232594040941e-7, 1.490116297020471e-7, 7.450581485102354e-8, 3.725290742551177e-8, 1.862645371275588e-8, 9.313226856377942e-9};
+
 
 typedef struct {
     uint8_t command_id;               // 1 byte: Il comando
@@ -242,9 +253,10 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 
 	case DRDY_Pin:										// con questo IRQ l'ADS1256 ci informa la conversione è completa
 
-//		htim2.Instance->CR1 |= TIM_CR1_CEN;				// triggering di one-shot timer per blink del LED onboard
-//		if (read_data_on_drdy)
-//			osSemaphoreRelease(DataReadySemaphoreHandle);	// se read_data_on_drdy = true allora sblocco il task per la lettura del dato
+		htim2.Instance->CR1 |= TIM_CR1_CEN;				// triggering di one-shot timer per blink del LED onboard
+
+		if (read_data_on_drdy)
+			osSemaphoreRelease(DRDY_Signal_SemHandle);	// se read_data_on_drdy = true allora sblocco il task per la lettura del dato sulla SPI
 
 		break;
 	}
@@ -352,6 +364,33 @@ void ADS1256_SendCommand(uint8_t commandID)
 
 	  delay_busywait(5ul);															// attendo 5 us (vedi configurazione di TIM9)
 }
+
+void ADS1256_ReadData()
+{
+	HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_RESET);						// abbasso CS
+
+	uint8_t rdatacommand = ADS1256_COM_RDATA;
+	HAL_SPI_Transmit(&hspi3, &rdatacommand, 1, HAL_MAX_DELAY);						// trasmetto il comando RDATA
+
+	delay_busywait(10);																// attendo 10 us (vedi configurazione di TIM9)
+
+	uint8_t adcbyte[3];
+	HAL_SPI_Receive(&hspi3, adcbyte, 3, HAL_MAX_DELAY);								// ricevo tre bytes via SPI
+
+	adccode = (int32_t)((uint32_t)adcbyte[0] << 24) | ((uint32_t)adcbyte[1] << 16) | ((uint32_t)adcbyte[2] << 8);		// riordino e allineo a sinistra i bytes
+	adccode = adccode >> 8;																								// sposto 8 bit a destra con estensione del segno
+
+	HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_SET);							// alzo CS
+
+	delay_busywait(5);
+}
+
+void ADS1256_Trigger()
+{
+	TIM3->CR1 |= TIM_CR1_CEN;
+	read_data_on_drdy = true;
+}
+
 
 /* USER CODE END 0 */
 
@@ -901,8 +940,7 @@ void StartCommand_Handler(void *argument)
 			case TRIGGER:
 				printf("Comando TRIGGER\n");
 
-				// TODO: Process command
-				// ...
+				ADS1256_Trigger();
 
 				SendResponse(frame_in.command_id, SUCCESS, 0, NULL);
 				break;
@@ -963,7 +1001,7 @@ void StartCommand_Handler(void *argument)
 			case PGA:
 				printf("Comando PGA\n");
 
-				uint8_t pga = frame_in.payload[0];
+				uint8_t pga_in = frame_in.payload[0];
 
 				// Validate parameter
 				// pga value   gain
@@ -976,12 +1014,13 @@ void StartCommand_Handler(void *argument)
 				//     6        64
 				//     7        64
 
-				if (pga > 7)
+				if (pga_in > 7)
 				{
 					SendResponse(frame_in.command_id, INVALID_PARAM_VALUE, 0, NULL);
 				}
 				else
 				{
+					pga = pga_in;
 					reg = (ADS1256_ReadRegister(ADS1256_REG_ADCON) & 0b11111000) | pga;
 					ADS1256_WriteRegister(ADS1256_REG_ADCON, reg);
 
@@ -1057,9 +1096,6 @@ void StartCommand_Handler(void *argument)
 
 				printf("Parametri: 0x%X 0x%X 0x%X\n", fsc1, fsc2, fsc3);
 
-				// TODO: Validate parameters
-				// ...
-
 				// TODO: Process command
 				// ...
 
@@ -1114,6 +1150,12 @@ void StartCommand_Handler(void *argument)
 				SendResponse(frame_in.command_id, SUCCESS, 6, payload);
 
 				break;
+			case DUMMY:
+				printf("Comando DUMMY\n");
+
+				read_data_on_drdy = !read_data_on_drdy;
+
+				break;
 
 			default:
 				SendResponse(frame_in.command_id, INVALID_COMMAND, 0, NULL);
@@ -1163,18 +1205,21 @@ void StartUART_TX_Task(void *argument)
 				buf[0] = STARTBYTE;
 				buf[1] = frame.statuscode;
 				buf[2] = frame.command_id;
+				buf[3] = frame.nbytes;
 
-				memcpy(&buf[3], &frame.payload,frame.nbytes);
+				memcpy(&buf[4], &frame.payload,frame.nbytes);
 
 				uint8_t checksum = 0;
-				for(uint8_t i = 0; i < (3+frame.nbytes); i++)
+
+				for(uint8_t i = 0; i < (4+frame.nbytes); i++)
 				{
 					checksum += buf[i];
 				}
 
-				buf[3+frame.nbytes] = checksum;
-
-				bytes_to_transmit = 4 + frame.nbytes;
+				buf[4+frame.nbytes] = checksum;
+																				// |--------------- 4 bytes ---------------|  |---- nbytes -----|  |1 byte|
+				bytes_to_transmit = 4 + frame.nbytes + 1;						// startbyte, statuscode, command_id, nbytes, [byte1, byte2, ...], checksum
+																				// [0]        [1]         [2]         [3]     [4]                  [4+nbytes]
 			}
 
 			HAL_UART_Transmit(&huart2, buf, bytes_to_transmit, 100);			// invio il buffer all'UART
@@ -1265,10 +1310,38 @@ void StartSPI_RX_Task(void *argument)
 {
   /* USER CODE BEGIN StartSPI_RX_Task */
   /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
+
+	CommsFrame_t frame;
+
+	for(;;)
+	{
+		osSemaphoreAcquire(DRDY_Signal_SemHandle, osWaitForever);		// Attendi indefinitamente che il semaforo venga rilasciato (cioè quando DRDY transisce low)
+
+		ADS1256_ReadData();
+
+		if (nmeas < naverage)
+		{
+			nmeas++;
+			adccodesum += adccode;
+		}
+		else
+		{
+			read_data_on_drdy = false;
+
+			dvoltage = (double)adccodesum/(double)nmeas * vres_lut[pga];
+
+			frame.command_id = TRIGGER;
+			frame.statuscode = SUCCESS;
+			frame.nbytes = sizeof(double);
+
+			memcpy(frame.payload, (const void *)&dvoltage, sizeof(double));
+
+			osMessageQueuePut(txDataQueueHandle, &frame, 0, 0);
+
+			nmeas = 0;
+			adccodesum = 0;
+		}
+	}
   /* USER CODE END StartSPI_RX_Task */
 }
 

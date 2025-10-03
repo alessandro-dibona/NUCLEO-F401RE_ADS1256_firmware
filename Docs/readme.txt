@@ -72,12 +72,12 @@ Response: NONE
 
 Command: PGA (0xEE)
 Description: Setup Programmable Gain Amplifier
-Parameters: B1 - Gain value code (0x01=1, 0x02=2, 0x03=4, 0x04=8, 0x05=16, 0x06=32, 0x07=64)
+Parameters: B1 - Gain value code (0x00=1, 0x01=2, 0x02=4, 0x03=8, 0x04=16, 0x05=32, 0x06=64, 0x07=64)
 Response: NONE
 
 Command: DRATE B1  (0xEF)
 Description: Set A/D Data Rate
-Parameters: B1 - Data rate code (0x03=2.5SPS, 0x13=5SPS, 0x23=10SPS, 0x33=15SPS, 0x43=25SPS, 0x53=30SPS, 0x63=50SPS, 0x72=60SPS, 0x82=100SPS, 0x92=500SPS, 0xA1=1kSPS, 0xB0=2kSPS, 0xC0=3.75kSPS, 0xD0=7.5kSPS, 0xE0=15kSPS, 0xF0=3=kSPS)
+Parameters: B1 - Data rate code (0x03=2.5SPS, 0x13=5SPS, 0x23=10SPS, 0x33=15SPS, 0x43=25SPS, 0x53=30SPS, 0x63=50SPS, 0x72=60SPS, 0x82=100SPS, 0x92=500SPS, 0xA1=1kSPS, 0xB0=2kSPS, 0xC0=3.75kSPS, 0xD0=7.5kSPS, 0xE0=15kSPS, 0xF0=30kSPS)
 Response: NONE
 
 Command: OFCW B1 B2 B3 (0xF0)
@@ -163,23 +163,68 @@ Queues
 =================================================================================================================
 
 Coda txDataQueue
-===================
+================
 
 La coda contiene messaggi di tipo CommsFrame_t prodotti dai task che devono inviare dati all'UART.
-I messaggi di questa coda vengono consumati dal task UART_TX_Task.
 
-La struttura CommsFrame_t viene usata così:
+I messaggi di questa coda vengono consumati dal consumer task UART_TX_Task.
 
-Se il pacchetto viene usato per inviare ACK o NAK command_id = ACK o NAK. Gli altri campi di CommsFrame_t vengono ignorati dal consumer.
+Qualsiasi task può accodare messaggi nella coda txDataQueue. 
+
+Nella coda txDataQueue i campi della struttura CommsFrame_t hanno questo significato:
+
+Se il pacchetto viene usato per inviare ACK o NAK:
+
+	command_id = ACK/NAK
+	statuscode = unused
+	nbytes 	   = unused
+	payload    = unused
+ 
+I campi unused saranno ignorati dal consumer.
 
 Se il pacchetto viene usato per inviare una risposta a un comando:
 
 	command_id = ID del comando
 	statuscode = SUCCESS o codice di errore
 	nbytes 	   = zero o numero di bytes del payload
-	payload    = bytes del payload, se presenti    
-  
-2) CommandQueue
+	payload    = bytes del payload, se presenti
+
+task UART_TX_Task
+=================
+	
+Il task UART_TX_Task gestisce in esclusiva la periferica di trasmissione via UART.
+ 
+Attende ed estrae i pacchetti CommsFrame_t dalla queue txDataQueue e li invia all'UART secondo questo schema:
+
+                 Se il pacchetto è un ACK/NAK viene inviato il solo byte corrispondente:
+                 [ACK/NAK]
+                 
+                 Se il pacchetto è completo si invia la seguente sequenza:
+                 [STARTBYTE] [STATUSCODE] [COMMAND] [NBYTES] [B1, B2, ...] [CHECKSUM]
+                 
+			             - STARTBYTE   = 0xAA
+			             - STATUSCODE  = 0x00 (SUCCESS) oppure ERRORCODE
+			             - COMMAND     = il codice del comando eseguito
+			             - NBYTES      = numero di bytes del payload (può essere zero)
+			             - B1, B2, ... = eventuale payload
+			             - CHECKSUM    = somma (modulo 256) dei bytes precedenti
+                   
+==================================================================================================================
+
+Coda CommandQueue
+=================
+
+La coda contiene messaggi di tipo CommsFrame_t prodotti dal task StartUART_RX_Task (task di ascolto dell'UART).
+
+I messaggi di questa coda vengono consumati dal consumer task Command_Handler.
+
+Nella coda CommandQueue i campi della struttura CommsFrame_t hanno questo significato:
+
+	command_id = ID del comando
+	statuscode = unused
+	nbytes 	   = zero o numero di bytes del payload (parametri del comando)
+	payload    = bytes del payload, se presenti
+	
 
 
 Messaggi nella queue CommandQueue
@@ -187,9 +232,10 @@ Messaggi nella queue CommandQueue
 
 STARTBYTE COMMAND [B1, B2, ...] CHECKSUM
 
-Se il messaggio è stato ricevuto senza errori di checksum viene immediatamente inviato ACK (0x06) nella coda txDataQueue. Il messaggio viene poi accodato in CommandQueue.
-Se il messaggio è stato ricevuto corrotto viene immediatamente inviato NAK (0x15) nella coda txDataQueue. Il messaggio viene ignorato e il PC eventualmente ritrasmette.
-
+Se il messaggio è stato ricevuto senza errori di checksum viene immediatamente inviato ACK (0x06) nella coda txDataQueue. 
+Il messaggio viene poi accodato in CommandQueue.
+Se il messaggio è stato ricevuto corrotto viene immediatamente inviato NAK (0x15) nella coda txDataQueue. 
+Il messaggio viene ignorato e il PC eventualmente ritrasmette.
 Il comando viene processato dal ADS1256 e viene inviato al PC:
 
 STARTBYTE STATUSCODE COMMAND [B1, B2, ...] CHECKSUM
@@ -218,8 +264,10 @@ RESET               -> 0xAA 0xE8 0x92                  Response -> 0x06 0xAA 0x0
 AVERAGE 0x05        -> 0xAA 0xF4 0x05 0xA3             Response -> 0x06 0xAA 0x00 0xF4 0x9E       
 AVERAGE 0x0A        -> 0xAA 0xF4 0x0A 0xA8             Response -> 0x06 0xAA 0x00 0xF4 0x9E
 DRATE 0x03          -> 0xAA 0xEF 0x03 0x9C             Response -> 0x06 0xAA 0x00 0xEF 0x99
-DRATE 0x23          -> 0xAA 0xEF 0x23 0xBC             Response -> 0x06 0xAA 0x00 0xEF 0x99     
-Unknown command     -> 0xAA 0xF7 0xA1                  Response -> 0x06 0xAA 0x01 0xF7 0xA2
+DRATE 0x23          -> 0xAA 0xEF 0x23 0xBC             Response -> 0x06 0xAA 0x00 0xEF 0x99
+TRIGGER             -> 0xAA 0xE6 0x90                  Response -> 0x06 0xAA 0x00 0xE6 0x90
+DUMMY               -> 0xAA 0xF7 0xA1                  Response -> 0x06 0xAA 0x00 0xF7 0xA1     
+Unknown command     -> 0xAA 0xFF 0xA9                  Response -> 0x06 0xAA 0x01 0xF7 0xA9
 Corrupted checksum  -> 0xAA 0xF0 0x41 0xE2 0x8F 0x4D   Response -> 0x15
 Invalid startbit    -> 0xA0 0xE0 0x8A                  Response -> 0x15
 ==================================================================================================================================
